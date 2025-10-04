@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#DC2626">
+    <meta name="description" content="HeartHouse Daily Earnings Tracker - Track daily services and earnings across multiple clinics">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="HeartHouse">
+    <title>HeartHouse - Daily Earnings Tracker</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" href="/icon-192.png">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="module">
+        const { createClient } = supabase;
+
+        // =====================================================
+        // SUPABASE CONFIGURATION
+        // =====================================================
+        // Replace with your Supabase project URL and anon key
+        const SUPABASE_URL = 'https://uuwdrthtwcoswhxfxxmv.supabase.co';
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV1d2RydGh0d2Nvc3doeGZ4eG12Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk1NzEyMDksImV4cCI6MjA3NTE0NzIwOX0.BtBL4-pB0Ctuk-5Tv_-Hx86H7wS9kOePPDAADoNC-8c';
+        
+        const supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        // =====================================================
+        // APP STATE
+        // =====================================================
+        let state = {
+            user: null,
+            view: 'entry',
+            selectedDate: new Date().toISOString().split('T')[0],
+            selectedClinic: null,
+            lineItems: [],
+            editingDayId: null,
+            clinics: [],
+            items: [],
+            days: [],
+            dateRange: { from: '', to: '' },
+            reportType: 'by_clinic',
+            selectedClinics: [],
+            selectedItems: [],
+            includeOther: true,
+            loading: false,
+            email: '',
+            showMagicLinkSent: false
+        };
+
+        // =====================================================
+        // SERVICE WORKER REGISTRATION (PWA)
+        // =====================================================
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js')
+                    .then(reg => console.log('Service Worker registered'))
+                    .catch(err => console.log('Service Worker registration failed:', err));
+            });
+        }
+
+        // =====================================================
+        // AUTH FUNCTIONS
+        // =====================================================
+        async function sendMagicLink() {
+            const email = state.email.trim();
+            if (!email) {
+                alert('Please enter your email');
+                return;
+            }
+
+            state.loading = true;
+            render();
+
+            const { error } = await supabaseClient.auth.signInWithOtp({
+                email: email,
+                options: {
+                    emailRedirectTo: window.location.origin
+                }
+            });
+
+            state.loading = false;
+
+            if (error) {
+                alert('Error: ' + error.message);
+            } else {
+                state.showMagicLinkSent = true;
+            }
+            render();
+        }
+
+        async function signOut() {
+            await supabaseClient.auth.signOut();
+            state.user = null;
+            render();
+        }
+
+        // Listen for auth changes
+        supabaseClient.auth.onAuthStateChange((event, session) => {
+            state.user = session?.user || null;
+            if (state.user) {
+                loadData();
+            }
+            render();
+        });
+
+        // =====================================================
+        // DATA LOADING
+        // =====================================================
+        async function loadData() {
+            state.loading = true;
+            render();
+
+            const [clinicsRes, itemsRes, daysRes] = await Promise.all([
+                supabaseClient.from('clinics').select('*').order('name'),
+                supabaseClient.from('items').select('*').order('label'),
+                supabaseClient.from('days').select(`
+                    *,
+                    clinic:clinics(*),
+                    day_items(*)
+                `).order('service_date', { ascending: false }).limit(50)
+            ]);
+
+            if (clinicsRes.data) state.clinics = clinicsRes.data;
+            if (itemsRes.data) state.items = itemsRes.data;
+            if (daysRes.data) state.days = daysRes.data;
+
+            state.loading = false;
+            render();
+        }
+
+        // =====================================================
+        // DAY OPERATIONS
+        // =====================================================
+        async function saveDay() {
+            if (!state.selectedDate || !state.selectedClinic || state.lineItems.length === 0) {
+                alert('Please select date, clinic, and add at least one item');
+                return;
+            }
+
+            const invalidItems = state.lineItems.filter(li => !li.itemId || li.count < 0 || li.unitAmount < 0);
+            if (invalidItems.length > 0) {
+                alert('Please ensure all items are selected and amounts are valid');
+                return;
+            }
+
+            const highCountItems = state.lineItems.filter(li => li.count > 50);
+            if (highCountItems.length > 0 && !confirm('Warning: Some items have very high counts (>50). Continue?')) {
+                return;
+            }
+
+            state.loading = true;
+            render();
+
+            if (state.editingDayId) {
+                // Update existing day
+                const { error: dayError } = await supabaseClient
+                    .from('days')
+                    .update({
+                        service_date: state.selectedDate,
+                        clinic_id: state.selectedClinic.id
+                    })
+                    .eq('id', state.editingDayId);
+
+                if (dayError) {
+                    alert('Error updating day: ' + dayError.message);
+                    state.loading = false;
+                    render();
+                    return;
+                }
+
+                // Delete old day items
+                await supabaseClient.from('day_items').delete().eq('day_id', state.editingDayId);
+
+                // Insert new day items
+                const dayItems = state.lineItems.map(li => ({
+                    day_id: state.editingDayId,
+                    item_id: li.itemId,
+                    count: li.count,
+                    unit_amount_received: li.unitAmount,
+                    line_total: li.lineTotal,
+                    note: li.note || null
+                }));
+
+                const { error: itemsError } = await supabaseClient.from('day_items').insert(dayItems);
+
+                if (itemsError) {
+                    alert('Error updating items: ' + itemsError.message);
+                } else {
+                    alert('Day updated successfully!');
+                    state.editingDayId = null;
+                    state.lineItems = [];
+                    state.selectedClinic = null;
+                    await loadData();
+                }
+            } else {
+                // Create new day
+                const { data: dayData, error: dayError } = await supabaseClient
+                    .from('days')
+                    .insert({
+                        service_date: state.selectedDate,
+                        clinic_id: state.selectedClinic.id,
+                        user_id: state.user.id
+                    })
+                    .select()
+                    .single();
+
+                if (dayError) {
+                    alert('Error saving day: ' + dayError.message);
+                    state.loading = false;
+                    render();
+                    return;
+                }
+
+                // Insert day items
+                const dayItems = state.lineItems.map(li => ({
+                    day_id: dayData.id,
+                    item_id: li.itemId,
+                    count: li.count,
+                    unit_amount_received: li.unitAmount,
+                    line_total: li.lineTotal,
+                    note: li.note || null
+                }));
+
+                const { error: itemsError } = await supabaseClient.from('day_items').insert(dayItems);
+
+                if (itemsError) {
+                    alert('Error saving items: ' + itemsError.message);
+                } else {
+                    alert('Day saved successfully!');
+                    state.lineItems = [];
+                    state.selectedClinic = null;
+                    await loadData();
+                }
+            }
+
+            state.loading = false;
+            render();
+        }
+
+        async function deleteDay(dayId) {
+            if (!confirm('Are you sure you want to delete this entry?')) return;
+
+            state.loading = true;
+            render();
+
+            const { error } = await supabaseClient.from('days').delete().eq('id', dayId);
+
+            if (error) {
+                alert('Error deleting day: ' + error.message);
+            } else {
+                alert('Entry deleted successfully!');
+                await loadData();
+            }
+
+            state.loading = false;
+            render();
+        }
+
+        function loadDayForEdit(day) {
+            state.editingDayId = day.id;
+            state.selectedDate = day.service_date;
+            state.selectedClinic = day.clinic;
+            state.lineItems = day.day_items.map(di => ({
+                id: Date.now() + Math.random(),
+                itemId: di.item_id,
+                count: di.count,
+                unitAmount: di.unit_amount_received,
+                lineTotal: di.line_total,
+                note: di.note || ''
+            }));
+            state.view = 'entry';
+            render();
+        }
+
+        function duplicatePreviousDay() {
+            if (state.days.length === 0) {
+                alert('No previous days to duplicate');
+                return;
+            }
+
+            const lastDay = state.days[0];
+            state.selectedClinic = lastDay.clinic;
+            state.lineItems = lastDay.day_items.map(di => ({
+                id: Date.now() + Math.random(),
+                itemId: di.item_id,
+                count: di.count,
+                unitAmount: di.unit_amount_received,
+                lineTotal: di.line_total,
+                note: di.note || ''
+            }));
+            render();
+        }
+
+        // =====================================================
+        // CSV IMPORT
+        // =====================================================
+        function handleCSVUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            Papa.parse(file, {
+                header: true,
+                skipEmptyLines: true,
+                complete: async (results) => {
+                    await importCSVData(results.data);
+                },
+                error: (error) => {
+                    alert('Error parsing CSV: ' + error.message);
+                }
+            });
+        }
+
+        async function importCSVData(rows) {
+            state.loading = true;
+            render();
+
+            let imported = 0;
+            let errors = 0;
+
+            for (const row of rows) {
+                try {
+                    // Find or create clinic
+                    let clinic = state.clinics.find(c => 
+                        c.code.toLowerCase() === row.clinic_code_or_name?.toLowerCase() ||
+                        c.name.toLowerCase() === row.clinic_code_or_name?.toLowerCase()
+                    );
+
+                    if (!clinic) {
+                        const useOther = confirm(`Clinic "${row.clinic_code_or_name}" not found. Map to "Other"?`);
+                        if (useOther) {
+                            clinic = state.clinics.find(c => c.code === 'OTHER');
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    // Find item
+                    const item = state.items.find(i => 
+                        i.label.toLowerCase() === row.item_label?.toLowerCase()
+                    );
+
+                    if (!item) {
+                        errors++;
+                        console.error(`Item "${row.item_label}" not found`);
+                        continue;
+                    }
+
+                    // Create or find day
+                    let day = state.days.find(d => 
+                        d.service_date === row.service_date && 
+                        d.clinic_id === clinic.id
+                    );
+
+                    if (!day) {
+                        const { data: dayData, error: dayError } = await supabaseClient
+                            .from('days')
+                            .insert({
+                                service_date: row.service_date,
+                                clinic_id: clinic.id,
+                                user_id: state.user.id
+                            })
+                            .select()
+                            .single();
+
+                        if (dayError) {
+                            errors++;
+                            console.error('Error creating day:', dayError);
+                            continue;
+                        }
+                        day = dayData;
+                    }
+
+                    // Create day item
+                    const lineTotal = row.line_total || (parseFloat(row.count) * parseFloat(row.unit_amount_received));
+                    
+                    const { error: itemError } = await supabaseClient
+                        .from('day_items')
+                        .insert({
+                            day_id: day.id,
+                            item_id: item.id,
+                            count: parseInt(row.count),
+                            unit_amount_received: parseFloat(row.unit_amount_received),
+                            line_total: parseFloat(lineTotal),
+                            note: row.note || null
+                        });
+
+                    if (itemError) {
+                        errors++;
+                        console.error('Error creating day item:', itemError);
+                    } else {
+                        imported++;
+                    }
+                } catch (err) {
+                    errors++;
+                    console.error('Error processing row:', err);
+                }
+            }
+
+            alert(`Import complete! Imported: ${imported}, Errors: ${errors}`);
+            await loadData();
+            state.loading = false;
+            render();
+        }
+
+        // =====================================================
+        // REPORTS
+        // =====================================================
+        function generateReport() {
+            const { from, to } = state.dateRange;
+            if (!from || !to) return { rows: [], total: 0 };
+
+            const filteredDays = state.days.filter(d => {
+                const date = d.service_date;
+                return date >= from && date <= to;
+            });
+
+            if (state.reportType === 'by_clinic') {
+                const grouped = {};
+                filteredDays.forEach(day => {
+                    if (!state.includeOther && day.clinic.code === 'OTHER') return;
+                    if (state.selectedClinics.length > 0 && !state.selectedClinics.includes(day.clinic_id)) return;
+
+                    if (!grouped[day.clinic_id]) {
+                        grouped[day.clinic_id] = { name: day.clinic.name, total: 0 };
+                    }
+                    day.day_items.forEach(di => {
+                        grouped[day.clinic_id].total += di.line_total;
+                    });
+                });
+
+                const rows = Object.values(grouped).map(g => ({ label: g.name, amount: g.total }));
+                const total = rows.reduce((sum, r) => sum + r.amount, 0);
+                return { rows, total };
+            }
+
+            if (state.reportType === 'by_item') {
+                const grouped = {};
+                filteredDays.forEach(day => {
+                    day.day_items.forEach(di => {
+                        const item = state.items.find(i => i.id === di.item_id);
+                        if (!item) return;
+                        if (!state.includeOther && item.code === 'OTHER') return;
+                        if (state.selectedItems.length > 0 && !state.selectedItems.includes(item.id)) return;
+
+                        if (!grouped[item.id]) {
+                            grouped[item.id] = { name: item.label, total: 0 };
+                        }
+                        grouped[item.id].total += di.line_total;
+                    });
+                });
+
+                const rows = Object.values(grouped).map(g => ({ label: g.name, amount: g.total }));
+                const total = rows.reduce((sum, r) => sum + r.amount, 0);
+                return { rows, total };
+            }
+
+            if (state.reportType === 'clinic_item') {
+                const grouped = {};
+                filteredDays.forEach(day => {
+                    if (!state.includeOther && day.clinic.code === 'OTHER') return;
+                    if (state.selectedClinics.length > 0 && !state.selectedClinics.includes(day.clinic_id)) return;
+
+                    day.day_items.forEach(di => {
+                        const item = state.items.find(i => i.id === di.item_id);
+                        if (!item) return;
+                        if (!state.includeOther && item.code === 'OTHER') return;
+                        if (state.selectedItems.length > 0 && !state.selectedItems.includes(item.id)) return;
+
+                        const key = `${day.clinic_id}_${item.id}`;
+                        if (!grouped[key]) {
+                            grouped[key] = { name: `${day.clinic.name} - ${item.label}`, total: 0 };
+                        }
+                        grouped[key].total += di.line_total;
+                    });
+                });
+
+                const rows = Object.values(grouped).map(g => ({ label: g.name, amount: g.total }));
+                const total = rows.reduce((sum, r) => sum + r.amount, 0);
+                return { rows, total };
+            }
+
+            return { rows: [], total: 0 };
+        }
+
+        function exportCSV() {
+            const { rows } = generateReport();
+            const csv = ['Label,Amount (AUD)', ...rows.map(r => `"${r.label}",${r.amount.toFixed(2)}`)].join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `hearthouse_report_${state.dateRange.from}_${state.dateRange.to}.csv`;
+            a.click();
+        }
+
+        // =====================================================
+        // UI HELPERS
+        // =====================================================
+        function addLineItem() {
+            state.lineItems.push({
+                id: Date.now() + Math.random(),
+                itemId: null,
+                count: 1,
+                unitAmount: 0,
+                lineTotal: 0,
+                note: ''
+            });
+            render();
+        }
+
+        function updateLineItem(id, field, value) {
+            const item = state.lineItems.find(li => li.id === id);
+            if (!item) return;
+
+            item[field] = value;
+
+            if (field === 'itemId') {
+                const selectedItem = state.items.find(i => i.id === value);
+                if (selectedItem) {
+                    item.unitAmount = selectedItem.default_unit_amount;
+                }
+            }
+
+            if (field === 'count' || field === 'unitAmount' || field === 'itemId') {
+                item.lineTotal = parseFloat((item.count * item.unitAmount).toFixed(2));
+            }
+
+            render();
+        }
+
+        function removeLineItem(id) {
+            state.lineItems = state.lineItems.filter(li => li.id !== id);
+            render();
+        }
+
+        function getDayTotal() {
+            return state.lineItems.reduce((sum, li) => sum + li.lineTotal, 0);
+        }
+
+        function cancelEdit() {
+            state.editingDayId = null;
+            state.lineItems = [];
+            state.selectedClinic = null;
+            state.selectedDate = new Date().toISOString().split('T')[0];
+            render();
+        }
+
+        function setPresetRange(preset) {
+            const today = new Date();
+            let from, to;
+
+            if (preset === 'this_month') {
+                from = new Date(today.getFullYear(), today.getMonth(), 1);
+                to = today;
+            } else if (preset === 'last_month') {
+                from = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+                to = new Date(today.getFullYear(), today.getMonth(), 0);
+            } else if (preset === 'fy') {
+                const year = today.getMonth() >= 6 ? today.getFullYear() : today.getFullYear() - 1;
+                from = new Date(year, 6, 1);
+                to = new Date(year + 1, 5, 30);
+            }
+
+            state.dateRange.from = from.toISOString().split('T')[0];
+            state.dateRange.to = to.toISOString().split('T')[0];
+            render();
+        }
+
+        // Initialize date range
+        const today = new Date();
+        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+        state.dateRange.from = firstDay.toISOString().split('T')[0];
+        state.dateRange.to = today.toISOString().split('T')[0];
+
+        // =====================================================
+        // RENDER
+        // =====================================================
+        function render() {
+            const root = document.getElementById('root');
+            
+            if (!state.user) {
+                root.innerHTML = renderAuthScreen();
+                return;
+            }
+
+            root.innerHTML = renderApp();
+        }
+
+        function renderAuthScreen() {
+            if (state.showMagicLinkSent) {
+                return `
+                    <div class="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+                        <div class="bg-white rounded-lg shadow-lg p-8 max-w-md w-full text-center">
+                            <div class="mb-4">
+                                <svg class="w-16 h-16 text-green-500 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 19v-8.93a2 2 0 01.89-1.664l7-4.666a2 2 0 012.22 0l7 4.666A2 2 0 0121 10.07V19M3 19a2 2 0 002 2h14a2 2 0 002-2M3 19l6.75-4.5M21 19l-6.75-4.5M3 10l6.75 4.5M21 10l-6.75 4.5m0 0l-1.14.76a2 2 0 01-2.22 0l-1.14-.76"></path>
+                                </svg>
+                            </div>
+                            <h2 class="text-2xl font-bold text-gray-900 mb-2">Check your email</h2>
+                            <p class="text-gray-600 mb-6">We've sent a magic link to <strong>${state.email}</strong>. Click the link to sign in.</p>
+                            <button onclick="location.reload()" class="text-red-600 hover:text-red-700 font-medium">
+                                Back to sign in
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            return `
+                <div class="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+                    <div class="bg-white rounded-lg shadow-lg p-8 max-w-md w-full">
+                        <div class="text-center mb-8">
+                            <div class="inline-block p-3 bg-red-100 rounded-full mb-4">
+                                <svg class="w-12 h-12 text-red-600" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+                                </svg>
+                            </div>
+                            <h1 class="text-3xl font-bold text-gray-900 mb-2">HeartHouse</h1>
+                            <p class="text-gray-600">Daily Earnings Tracker</p>
+                        </div>
+
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Email Address</label>
+                                <input 
+                                    type="email" 
+                                    placeholder="your@email.com"
+                                    value="${state.email}"
+                                    oninput="state.email = this.value"
+                                    onkeypress="if(event.key === 'Enter') sendMagicLink()"
+                                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+                                />
+                            </div>
+
+                            <button 
+                                onclick="sendMagicLink()"
+                                ${state.loading ? 'disabled' : ''}
+                                class="w-full py-3 bg-red-600 text-white rounded-lg font-medium hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                ${state.loading ? 'Sending...' : 'Send Magic Link'}
+                            </button>
+
+                            <p class="text-xs text-gray-500 text-center">
+                                We'll send you a secure link to sign in without a password
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderApp() {
+            const dayTotal = getDayTotal();
+
+            return `
+                <div class="min-h-screen bg-gray-50">
+                    <!-- Header -->
+                    <div class="bg-red-600 text-white p-4 shadow-lg">
+                        <div class="max-w-4xl mx-auto flex items-center justify-between">
+                            <div class="flex items-center gap-3">
+                                <svg class="w-8 h-8" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+                                </svg>
+                                <h1 class="text-2xl font-bold">HeartHouse</h1>
+                            </div>
+                            <button onclick="signOut()" class="text-sm hover:underline">
+                                Sign Out
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Navigation -->
+                    <div class="bg-white border-b">
+                        <div class="max-w-4xl mx-auto flex">
+                            <button onclick="state.view = 'entry'; render()" class="flex-1 py-3 px-4 flex items-center justify-center gap-2 ${state.view === 'entry' ? 'bg-red-50 text-red-600 border-b-2 border-red-600' : 'text-gray-600'}">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+                                Entry
+                            </button>
+                            <button onclick="state.view = 'history'; render()" class="flex-1 py-3 px-4 flex items-center justify-center gap-2 ${state.view === 'history' ? 'bg-red-50 text-red-600 border-b-2 border-red-600' : 'text-gray-600'}">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
+                                History
+                            </button>
+                            <button onclick="state.view = 'reports'; render()" class="flex-1 py-3 px-4 flex items-center justify-center gap-2 ${state.view === 'reports' ? 'bg-red-50 text-red-600 border-b-2 border-red-600' : 'text-gray-600'}">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                                Reports
+                            </button>
+                            <button onclick="state.view = 'import'; render()" class="flex-1 py-3 px-4 flex items-center justify-center gap-2 ${state.view === 'import' ? 'bg-red-50 text-red-600 border-b-2 border-red-600' : 'text-gray-600'}">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                                Import
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Content -->
+                    <div class="max-w-4xl mx-auto p-4">
+                        ${state.view === 'entry' ? renderEntryView(dayTotal) : ''}
+                        ${state.view === 'history' ? renderHistoryView() : ''}
+                        ${state.view === 'reports' ? renderReportsView() : ''}
+                        ${state.view === 'import' ? renderImportView() : ''}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderEntryView(dayTotal) {
+            return `
+                <div class="space-y-4">
+                    ${state.editingDayId ? `
+                        <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3 flex items-center justify-between">
+                            <span class="text-yellow-800 font-medium">Editing existing entry</span>
+                            <button onclick="cancelEdit()" class="px-3 py-1 text-sm bg-white border border-yellow-300 rounded hover:bg-yellow-50">
+                                Cancel Edit
+                            </button>
+                        </div>
+                    ` : ''}
+
+                    ${state.days.length > 0 ? `
+                        <button onclick="duplicatePreviousDay()" class="w-full py-2 bg-blue-50 text-blue-600 rounded-lg border border-blue-200 hover:bg-blue-100 font-medium">
+                            📋 Duplicate Previous Day
+                        </button>
+                    ` : ''}
+
+                    <!-- Date Selection -->
+                    <div class="bg-white p-4 rounded-lg shadow">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Service Date</label>
+                        <input type="date" value="${state.selectedDate}" onchange="state.selectedDate = this.value; render()" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                    </div>
+
+                    <!-- Clinic Selection -->
+                    <div class="bg-white p-4 rounded-lg shadow">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Clinic</label>
+                        <select onchange="state.selectedClinic = state.clinics.find(c => c.id === this.value); render()" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <option value="">Select clinic...</option>
+                            ${state.clinics.map(c => `<option value="${c.id}" ${state.selectedClinic?.id === c.id ? 'selected' : ''}>${c.name} (${c.code})</option>`).join('')}
+                        </select>
+                    </div>
+
+                    <!-- Line Items -->
+                    <div class="bg-white p-4 rounded-lg shadow space-y-3">
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="font-medium text-gray-900">Items</h3>
+                            <button onclick="addLineItem()" class="flex items-center gap-1 px-3 py-1 bg-red-600 text-white rounded-md hover:bg-red-700">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                                Add Item
+                            </button>
+                        </div>
+
+                        ${state.lineItems.map(li => {
+                            const item = state.items.find(i => i.id === li.itemId);
+                            return `
+                                <div class="border border-gray-200 rounded-md p-3 space-y-2">
+                                    <div class="flex justify-between items-start">
+                                        <select value="${li.itemId || ''}" onchange="updateLineItem('${li.id}', 'itemId', this.value)" class="flex-1 px-2 py-1 border border-gray-300 rounded text-sm">
+                                            <option value="">Select item...</option>
+                                            ${state.items.map(item => `<option value="${item.id}">${item.label}</option>`).join('')}
+                                        </select>
+                                        <button onclick="removeLineItem('${li.id}')" class="ml-2 p-1 text-red-600 hover:bg-red-50 rounded">
+                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                        </button>
+                                    </div>
+
+                                    <div class="grid grid-cols-3 gap-2">
+                                        <div>
+                                            <label class="block text-xs text-gray-600 mb-1">Count</label>
+                                            <input type="number" value="${li.count}" onchange="updateLineItem('${li.id}', 'count', parseInt(this.value) || 0)" class="w-full px-2 py-1 border border-gray-300 rounded text-sm" min="0">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs text-gray-600 mb-1">Unit ($)</label>
+                                            <input type="number" value="${li.unitAmount}" onchange="updateLineItem('${li.id}', 'unitAmount', parseFloat(this.value) || 0)" class="w-full px-2 py-1 border border-gray-300 rounded text-sm" min="0" step="0.01">
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs text-gray-600 mb-1">Total ($)</label>
+                                            <input type="number" value="${li.lineTotal}" onchange="updateLineItem('${li.id}', 'lineTotal', parseFloat(this.value) || 0)" class="w-full px-2 py-1 border border-gray-300 rounded text-sm bg-gray-50" step="0.01">
+                                        </div>
+                                    </div>
+
+                                    <input type="text" value="${li.note}" onchange="updateLineItem('${li.id}', 'note', this.value)" placeholder="Note (optional)" class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                                </div>
+                            `;
+                        }).join('')}
+
+                        ${state.lineItems.length > 0 ? `
+                            <div class="pt-3 border-t border-gray-200">
+                                <div class="flex justify-between items-center text-lg font-bold">
+                                    <span>Day Total:</span>
+                                    <span class="text-red-600">${dayTotal.toFixed(2)}</span>
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+
+                    <button onclick="saveDay()" ${state.loading ? 'disabled' : ''} class="w-full py-3 bg-red-600 text-white rounded-lg font-medium hover:bg-red-700 disabled:opacity-50">
+                        ${state.loading ? 'Saving...' : (state.editingDayId ? 'Update Day' : 'Save Day')}
+                    </button>
+                </div>
+            `;
+        }
+
+        function renderHistoryView() {
+            return `
+                <div class="space-y-4">
+                    <div class="bg-white p-4 rounded-lg shadow">
+                        <h2 class="text-xl font-bold mb-4">Recent Entries</h2>
+                        <div class="space-y-2">
+                            ${state.days.length === 0 ? `
+                                <p class="text-gray-500 text-center py-8">No entries yet</p>
+                            ` : state.days.map(day => `
+                                <div class="border border-gray-200 rounded-lg p-4 hover:bg-gray-50">
+                                    <div class="flex justify-between items-start mb-2">
+                                        <div>
+                                            <div class="font-medium text-gray-900">
+                                                ${new Date(day.service_date).toLocaleDateString('en-AU', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' })}
+                                            </div>
+                                            <div class="text-sm text-gray-600">${day.clinic?.name || 'Unknown Clinic'}</div>
+                                            <div class="text-xs text-gray-500 mt-1">${day.day_items.length} item${day.day_items.length !== 1 ? 's' : ''}</div>
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="text-lg font-bold text-red-600">${day.day_items.reduce((sum, di) => sum + di.line_total, 0).toFixed(2)}</div>
+                                            <div class="flex gap-2 mt-2">
+                                                <button onclick='loadDayForEdit(${JSON.stringify(day).replace(/'/g, "\\'")})'  class="p-1 text-blue-600 hover:bg-blue-50 rounded" title="Edit">
+                                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                                </button>
+                                                <button onclick="deleteDay('${day.id}')" class="p-1 text-red-600 hover:bg-red-50 rounded" title="Delete">
+                                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="mt-3 pt-3 border-t border-gray-100 space-y-1">
+                                        ${day.day_items.map(di => {
+                                            const item = state.items.find(i => i.id === di.item_id);
+                                            return `
+                                                <div class="flex justify-between text-sm">
+                                                    <span class="text-gray-600">
+                                                        ${item?.label || 'Unknown'} × ${di.count}
+                                                        ${di.note ? `<span class="text-gray-400 ml-1">(${di.note})</span>` : ''}
+                                                    </span>
+                                                    <span class="text-gray-900 font-mono">${di.line_total.toFixed(2)}</span>
+                                                </div>
+                                            `;
+                                        }).join('')}
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderReportsView() {
+            const report = generateReport();
+            
+            return `
+                <div class="space-y-4">
+                    <!-- Report Controls -->
+                    <div class="bg-white p-4 rounded-lg shadow space-y-3">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Report Type</label>
+                            <select value="${state.reportType}" onchange="state.reportType = this.value; render()" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                <option value="by_clinic">By Clinic</option>
+                                <option value="by_item">By Item (All Clinics)</option>
+                                <option value="clinic_item">Clinic + Item</option>
+                            </select>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">From</label>
+                                <input type="date" value="${state.dateRange.from}" onchange="state.dateRange.from = this.value; render()" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">To</label>
+                                <input type="date" value="${state.dateRange.to}" onchange="state.dateRange.to = this.value; render()" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            </div>
+                        </div>
+
+                        <div class="flex gap-2">
+                            <button onclick="setPresetRange('this_month')" class="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200">This Month</button>
+                            <button onclick="setPresetRange('last_month')" class="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200">Last Month</button>
+                            <button onclick="setPresetRange('fy')" class="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200">FY 2024-25</button>
+                        </div>
+
+                        <div class="flex items-center gap-2">
+                            <input type="checkbox" ${state.includeOther ? 'checked' : ''} onchange="state.includeOther = this.checked; render()" class="rounded">
+                            <label class="text-sm text-gray-700">Include "Other"</label>
+                        </div>
+                    </div>
+
+                    <!-- Report Results -->
+                    <div class="bg-white rounded-lg shadow overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="w-full">
+                                <thead class="bg-gray-50 border-b border-gray-200">
+                                    <tr>
+                                        <th class="px-4 py-3 text-left text-sm font-medium text-gray-700">Label</th>
+                                        <th class="px-4 py-3 text-right text-sm font-medium text-gray-700">Amount (AUD)</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-200">
+                                    ${report.rows.map(row => `
+                                        <tr>
+                                            <td class="px-4 py-3 text-sm text-gray-900">${row.label}</td>
+                                            <td class="px-4 py-3 text-sm text-gray-900 text-right font-mono">${row.amount.toFixed(2)}</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                                <tfoot class="bg-gray-50 border-t-2 border-gray-300">
+                                    <tr>
+                                        <td class="px-4 py-3 text-sm font-bold text-gray-900">Grand Total</td>
+                                        <td class="px-4 py-3 text-sm font-bold text-red-600 text-right font-mono">${report.total.toFixed(2)}</td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </div>
+
+                        <div class="p-4 border-t border-gray-200">
+                            <button onclick="exportCSV()" class="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                Export CSV
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderImportView() {
+            return `
+                <div class="bg-white p-6 rounded-lg shadow">
+                    <h2 class="text-xl font-bold mb-4">Import CSV</h2>
+                    <p class="text-gray-600 mb-4">
+                        CSV format: <code class="bg-gray-100 px-2 py-1 rounded text-sm">service_date, clinic_code_or_name, item_label, count, unit_amount_received, line_total(optional), note(optional)</code>
+                    </p>
+                    <input
+                        type="file"
+                        accept=".csv"
+                        onchange="handleCSVUpload(event)"
+                        class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:bg-red-50 file:text-red-600 hover:file:bg-red-100 cursor-pointer"
+                    />
+                    ${state.loading ? '<p class="text-sm text-gray-500 mt-2">Importing...</p>' : ''}
+                </div>
+            `;
+        }
+
+        // Check session on load
+        supabaseClient.auth.getSession().then(({ data: { session } }) => {
+            state.user = session?.user || null;
+            if (state.user) {
+                loadData();
+            }
+            render();
+        });
+
+        // Make functions global
+        window.sendMagicLink = sendMagicLink;
+        window.signOut = signOut;
+        window.saveDay = saveDay;
+        window.deleteDay = deleteDay;
+        window.loadDayForEdit = loadDayForEdit;
+        window.duplicatePreviousDay = duplicatePreviousDay;
+        window.addLineItem = addLineItem;
+        window.updateLineItem = updateLineItem;
+        window.removeLineItem = removeLineItem;
+        window.cancelEdit = cancelEdit;
+        window.setPresetRange = setPresetRange;
+        window.exportCSV = exportCSV;
+        window.handleCSVUpload = handleCSVUpload;
+    </script>
+</body>
+</html>
