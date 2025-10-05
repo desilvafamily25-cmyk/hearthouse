@@ -771,10 +771,11 @@
               return `
                 <div class="border border-gray-200 rounded-md p-3 space-y-2">
                   <div class="flex justify-between items-start">
-                    <select value="${li.itemId || ''}" onchange="updateLineItem('${li.id}', 'itemId', this.value)" class="flex-1 px-2 py-1 border border-gray-300 rounded text-sm">
-                      <option value="">Select item...</option>
-                      ${state.items.map(item => `<option value="${item.id}">${item.label}</option>`).join('')}
-                    </select>
+<select onchange="updateLineItem('${li.id}', 'itemId', this.value)" class="flex-1 px-2 py-1 border border-gray-300 rounded text-sm">
+  <option value="">Select item...</option>
+  ${state.items.map(it => `<option value="${it.id}" ${String(li.itemId) === String(it.id) ? 'selected' : ''}>${it.label}</option>`).join('')}
+</select>
+
                     <button onclick="removeLineItem('${li.id}')" class="ml-2 p-1 text-red-600 hover:bg-red-50 rounded" title="Remove">
                       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                     </button>
