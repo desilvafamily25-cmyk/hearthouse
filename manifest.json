@@ -1,9 +1,12 @@
 {
+  "id": "/",
   "name": "HeartHouse - Daily Earnings Tracker",
   "short_name": "HeartHouse",
   "description": "Track daily services and earnings across multiple clinics",
-  "start_url": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["standalone", "window-controls-overlay"],
   "background_color": "#FFFFFF",
   "theme_color": "#DC2626",
   "orientation": "portrait",
@@ -21,12 +24,40 @@
       "purpose": "any maskable"
     }
   ],
+  "shortcuts": [
+    {
+      "name": "New entry",
+      "short_name": "Entry",
+      "description": "Create a new daily entry",
+      "url": "/?action=new-entry",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "History",
+      "short_name": "History",
+      "description": "View recent entries",
+      "url": "/?view=history",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Reports",
+      "short_name": "Reports",
+      "description": "Open reports dashboard",
+      "url": "/?view=reports",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ],
+  "handle_links": "preferred",
   "categories": ["business", "medical", "productivity"],
   "screenshots": [
     {
       "src": "/screenshot1.png",
       "sizes": "540x720",
-      "type": "image/png"
+      "type": "image/png",
+      "form_factor": "narrow"
     }
-  ]
+  ],
+  "lang": "en-AU",
+  "dir": "ltr",
+  "prefer_related_applications": false
 }
