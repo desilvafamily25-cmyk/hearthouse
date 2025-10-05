@@ -1,116 +1,122 @@
 // HeartHouse Service Worker
-// Enables offline functionality and caching
+// Enables offline functionality and caching with safe update behavior
 
-const CACHE_NAME = 'hearthouse-v1';
-const RUNTIME_CACHE = 'hearthouse-runtime-v1';
+// ======= VERSION (bump to force updates) =======
+const SW_VERSION = 'v2';
 
-// Assets to cache on install
+// Separate names so old caches get cleaned up
+const PRECACHE = `hearthouse-precache-${SW_VERSION}`;
+const RUNTIME  = `hearthouse-runtime-${SW_VERSION}`;
+
+// Assets to cache on install (app shell)
 const PRECACHE_URLS = [
-  '/',
+  '/',                // app shell
   '/index.html',
   '/manifest.json',
   '/icon-192.png',
-  '/icon-512.png',
-  'https://cdn.tailwindcss.com',
-  'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2',
-  'https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js'
+  '/icon-512.png'
+  // Note: we avoid precaching external CDNs to reduce staleness.
 ];
 
-// Install event - cache core assets
+// ----- INSTALL -----
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => {
-        console.log('Opened cache');
-        return cache.addAll(PRECACHE_URLS);
-      })
+    caches.open(PRECACHE)
+      .then(cache => cache.addAll(PRECACHE_URLS))
       .then(() => self.skipWaiting())
-      .catch(error => console.log('Cache install failed:', error))
+      .catch(err => console.log('[SW] precache failed:', err))
   );
 });
 
-// Activate event - clean up old caches
+// ----- ACTIVATE -----
 self.addEventListener('activate', (event) => {
-  const currentCaches = [CACHE_NAME, RUNTIME_CACHE];
-  event.waitUntil(
-    caches.keys().then(cacheNames => {
-      return cacheNames.filter(cacheName => !currentCaches.includes(cacheName));
-    }).then(cachesToDelete => {
-      return Promise.all(cachesToDelete.map(cacheToDelete => {
-        console.log('Deleting old cache:', cacheToDelete);
-        return caches.delete(cacheToDelete);
-      }));
-    }).then(() => self.clients.claim())
-  );
+  event.waitUntil((async () => {
+    // Clean up any old caches
+    const keep = new Set([PRECACHE, RUNTIME]);
+    const names = await caches.keys();
+    await Promise.all(names.map(n => !keep.has(n) && caches.delete(n)));
+
+    // Enable navigation preload if available (faster first paint)
+    if ('navigationPreload' in self.registration) {
+      await self.registration.navigationPreload.enable();
+    }
+
+    await self.clients.claim();
+  })());
 });
 
-// Fetch event - serve from cache, fallback to network
+// Utility to get cached index.html regardless of query strings
+async function cachedAppShell() {
+  // Try match ignoring query params
+  const cache = await caches.open(PRECACHE);
+  const match = await cache.match('/index.html', { ignoreSearch: true });
+  if (match) return match;
+
+  // Fallback to root if needed
+  return cache.match('/', { ignoreSearch: true });
+}
+
+// ----- FETCH -----
 self.addEventListener('fetch', (event) => {
-  // Skip cross-origin requests
-  if (!event.request.url.startsWith(self.location.origin)) {
-    return;
+  const { request } = event;
+  const url = new URL(request.url);
+
+  // 1) Always bypass SW for cross-origin (except you can add allowlists if needed)
+  if (url.origin !== self.location.origin) {
+    return; // let the browser handle it
   }
 
-  // Skip Supabase API calls - always go to network
-  if (event.request.url.includes('supabase.co')) {
+  // 2) Never cache Supabase API/auth; always go to network
+  if (url.hostname.includes('supabase.co')) {
     event.respondWith(
-      fetch(event.request).catch(() => {
-        // If offline and trying to reach Supabase, return offline message
-        return new Response(JSON.stringify({ 
-          error: 'Offline - changes will sync when connection is restored' 
-        }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
+      fetch(request).catch(() => {
+        return new Response(JSON.stringify({
+          error: 'Offline - changes will sync when connection is restored'
+        }), { headers: { 'Content-Type': 'application/json' }});
       })
     );
     return;
   }
 
-  // For navigation requests
-  if (event.request.mode === 'navigate') {
-    event.respondWith(
-      caches.match(event.request)
-        .then(cachedResponse => {
-          if (cachedResponse) {
-            return cachedResponse;
-          }
-          return fetch(event.request);
-        })
-    );
+  // 3) Navigations (address bar, PWA launches) -> network-first, fallback to cached app shell
+  if (request.mode === 'navigate') {
+    event.respondWith((async () => {
+      try {
+        // If navigation preload is enabled, use it
+        const preload = await event.preloadResponse;
+        if (preload) return preload;
+
+        // Network first to pick up new deploys
+        const fresh = await fetch(request, { cache: 'no-store' });
+        return fresh;
+      } catch {
+        // Offline: serve cached shell
+        const shell = await cachedAppShell();
+        return shell || new Response('Offline', { status: 503 });
+      }
+    })());
     return;
   }
 
-  // For all other requests - cache first, then network
-  event.respondWith(
-    caches.match(event.request).then(cachedResponse => {
-      if (cachedResponse) {
-        return cachedResponse;
-      }
+  // 4) Same-origin GET assets -> stale-while-revalidate
+  if (request.method === 'GET') {
+    event.respondWith((async () => {
+      const cache = await caches.open(RUNTIME);
+      const cached = await cache.match(request);
+      const networkPromise = fetch(request).then((response) => {
+        // Only cache OK responses
+        if (response && response.status === 200 && response.type === 'basic') {
+          cache.put(request, response.clone());
+        }
+        return response;
+      }).catch(() => undefined);
 
-      return caches.open(RUNTIME_CACHE).then(cache => {
-        return fetch(event.request).then(response => {
-          // Cache the response for future use
-          return cache.put(event.request, response.clone()).then(() => {
-            return response;
-          });
-        }).catch(() => {
-          // Return offline fallback if available
-          return caches.match('/offline.html');
-        });
-      });
-    })
-  );
-});
-
-// Background sync for offline data
-self.addEventListener('sync', (event) => {
-  if (event.tag === 'sync-data') {
-    event.waitUntil(syncOfflineData());
+      // Return cached immediately, update in background; or await network if no cache
+      return cached || networkPromise || (await cachedAppShell()) || new Response('Offline', { status: 503 });
+    })());
+    return;
   }
-});
 
-async function syncOfflineData() {
-  // Get pending data from IndexedDB and sync with Supabase
-  // This would be implemented based on your offline storage strategy
-  console.log('Syncing offline data...');
-}
+  // 5) Everything else — default
+  // (POST/PUT/PATCH/DELETE will fall through to network)
+});
