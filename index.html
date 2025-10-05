@@ -524,25 +524,33 @@
       render();
     }
 
-    function updateLineItem(id, field, value) {
-      const item = state.lineItems.find(li => li.id === id);
-      if (!item) return;
+   function updateLineItem(id, field, value) {
+  const item = state.lineItems.find(li => li.id === id);
+  if (!item) return;
 
-      item[field] = value;
+  // Raw assign first
+  item[field] = value;
 
-      if (field === 'itemId') {
-        const selectedItem = state.items.find(i => i.id === value);
-        if (selectedItem) {
-          item.unitAmount = selectedItem.default_unit_amount;
-        }
-      }
-
-      if (field === 'count' || field === 'unitAmount' || field === 'itemId') {
-        item.lineTotal = parseFloat((item.count * item.unitAmount).toFixed(2));
-      }
-
-      render();
+  // If item changed, pull default unit from catalog
+  if (field === 'itemId') {
+    const selectedItem = state.items.find(i => String(i.id) === String(value));
+    if (selectedItem) {
+      item.unitAmount = parseFloat(selectedItem.default_unit_amount || 0);
+    } else {
+      item.unitAmount = 0;
     }
+  }
+
+  // Normalise numbers before computing totals
+  if (field === 'count' || field === 'unitAmount' || field === 'itemId') {
+    const countNum = Number(item.count) || 0;
+    const unitNum  = Number(item.unitAmount) || 0;
+    item.lineTotal = parseFloat((countNum * unitNum).toFixed(2));
+  }
+
+  render();
+}
+
 
     function removeLineItem(id) {
       state.lineItems = state.lineItems.filter(li => li.id !== id);
